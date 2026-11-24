@@ -363,6 +363,9 @@ void OptionsDialog::loadBehaviorTabOptions()
 
 #if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
     m_ui->checkProgramUpdates->setChecked(pref->isUpdateCheckEnabled());
+#ifdef Q_OS_WIN
+    m_ui->checkProgramUpdates->setText(tr("Automatically download and install updates in the background"));
+#endif
 #else
     m_ui->checkProgramUpdates->setVisible(false);
 #endif

@@ -332,6 +332,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
         powermanagement/inhibitorwindows.h
         powermanagement/inhibitorwindows.cpp
         programupdater.h
-        programupdater.cpp
+        programupdater_win.cpp
     )
 endif()

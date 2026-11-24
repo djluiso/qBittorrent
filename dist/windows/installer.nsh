@@ -1,6 +1,14 @@
 Var uninstallerPath
+Var otaHadDesktopLnk
 
 Section "-hidden"
+
+    ; OTA: the previous uninstaller removes the desktop shortcut; remember it to restore it.
+    ${If} ${FileExists} "$DESKTOP\qBittorrent.lnk"
+      StrCpy $otaHadDesktopLnk "1"
+    ${EndIf}
+    ; Tell the previous uninstaller this is an upgrade, so it keeps the OTA task.
+    System::Call 'Kernel32::SetEnvironmentVariable(t "QBT_OTA_UPGRADE", t "1")i'
 
     ;Search if qBittorrent is already installed.
     FindFirst $0 $1 "$uninstallerPath\uninst.exe"
@@ -63,6 +71,9 @@ Section $(inst_qbt_req) ;"qBittorrent (required)"
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\qBittorrent" "NoModify" 1
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\qBittorrent" "NoRepair" 1
   WriteUninstaller "uninst.exe"
+
+  ; OTA: register the SYSTEM task that silently installs stable updates (qbittorrent.exe --ota-update)
+  ExecWait '"$INSTDIR\qbittorrent.exe" --ota-register'
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
   IntFmt $0 "0x%08X" $0
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\qBittorrent" "EstimatedSize" "$0"
@@ -74,6 +85,13 @@ Section /o $(inst_desktop) ;"Create Desktop Shortcut"
 
   CreateShortCut "$DESKTOP\qBittorrent.lnk" "$INSTDIR\qbittorrent.exe"
 
+SectionEnd
+
+Section "-ota_restore_desktop"
+  ${If} $otaHadDesktopLnk == "1"
+  ${AndIfNot} ${FileExists} "$DESKTOP\qBittorrent.lnk"
+    CreateShortCut "$DESKTOP\qBittorrent.lnk" "$INSTDIR\qbittorrent.exe"
+  ${EndIf}
 SectionEnd
 
 Section $(inst_startmenu) ;"Create Start Menu Shortcut"

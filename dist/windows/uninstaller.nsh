@@ -1,3 +1,11 @@
+Section "-un.ota"
+  ; Remove the OTA task, unless the uninstaller runs as part of an upgrade
+  ReadEnvStr $0 "QBT_OTA_UPGRADE"
+  ${If} $0 != "1"
+    ExecWait '"$INSTDIR\qbittorrent.exe" --ota-unregister'
+  ${EndIf}
+SectionEnd
+
 Section "un.$(remove_files)" ;"un.Remove files"
   SectionIn RO
 

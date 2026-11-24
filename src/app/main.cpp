@@ -71,6 +71,10 @@ Q_IMPORT_PLUGIN(QICOPlugin)
 #include "base/profile.h"
 #include "base/settingvalue.h"
 #include "base/version.h"
+
+#ifdef Q_OS_WIN
+#include "base/ota_win.h"
+#endif
 #include "application.h"
 #include "cmdoptions.h"
 #include "legalnotice.h"
@@ -178,6 +182,12 @@ namespace
 // Main
 int main(int argc, char *argv[])
 {
+#ifdef Q_OS_WIN
+    // Windowless OTA update modes used by the installer and the "qBittorrent OTA Update" task
+    if (const int otaResult = Ota::runCommand(argc, argv); otaResult >= 0)
+        return otaResult;
+#endif
+
 #ifdef DISABLE_GUI
     setvbuf(stdout, nullptr, _IONBF, 0);
 #endif

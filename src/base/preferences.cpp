@@ -1520,9 +1520,16 @@ void Preferences::setPythonExecutablePath(const Path &path)
 }
 
 #if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+#ifdef Q_OS_WIN
+// OTA builds use a separate key: "automatically install updates" (also read by the OTA task)
+const QString UPDATE_CHECK_KEY = u"Preferences/Advanced/otaUpdates"_s;
+#else
+const QString UPDATE_CHECK_KEY = u"Preferences/Advanced/updateCheck"_s;
+#endif
+
 bool Preferences::isUpdateCheckEnabled() const
 {
-    return value(u"Preferences/Advanced/updateCheck"_s, true);
+    return value(UPDATE_CHECK_KEY, true);
 }
 
 void Preferences::setUpdateCheckEnabled(const bool enabled)
@@ -1530,7 +1537,7 @@ void Preferences::setUpdateCheckEnabled(const bool enabled)
     if (enabled == isUpdateCheckEnabled())
         return;
 
-    setValue(u"Preferences/Advanced/updateCheck"_s, enabled);
+    setValue(UPDATE_CHECK_KEY, enabled);
 }
 #endif
 

@@ -53,6 +53,22 @@ public:
     Version getNewVersion() const;
     bool updateProgram() const;
 
+#ifdef Q_OS_WIN
+    // OTA (over-the-air) updates: a privileged scheduled task installed by the
+    // qBittorrent installer checks, downloads, verifies and silently installs
+    // stable releases. The app only triggers it and reports its status.
+    struct OtaStatus
+    {
+        QString state;            // checking, downloading, staged, installing, uptodate, disabled, error, timeout
+        QString installedVersion;
+        QString availableVersion;
+        QString message;
+    };
+
+    OtaStatus otaStatus() const;
+    static bool triggerOtaTask();
+#endif
+
 signals:
     void updateCheckFinished();
 
@@ -69,6 +85,9 @@ private:
     void handleFinishedRequest();
     RemoteSource getLatestRemoteSource() const;
 
+#ifdef Q_OS_WIN
+    OtaStatus m_otaStatus;
+#endif
     int m_pendingRequestCount = 0;
     Version m_qbtMainVersion;
     Version m_qbtBackupVersion;

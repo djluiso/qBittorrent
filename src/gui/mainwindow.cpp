@@ -65,6 +65,7 @@
 #include "base/bittorrent/session.h"
 #include "base/bittorrent/sessionstatus.h"
 #include "base/global.h"
+#include "base/logger.h"
 #include "base/net/downloadmanager.h"
 #include "base/path.h"
 #include "base/plugins/pluginsengine.h"
@@ -896,6 +897,11 @@ void MainWindow::cleanup()
     if (m_programUpdateTimer)
         m_programUpdateTimer->stop();
 #endif
+#ifdef Q_OS_WIN
+    // OTA: let the update task install a staged update once qBittorrent has exited.
+    // The task itself honours the "automatically install updates" setting.
+    ProgramUpdater::triggerOtaTask();
+#endif
 
     // remove all child widgets
     while (auto *w = findChild<QWidget *>())
@@ -1714,6 +1720,45 @@ void MainWindow::handleUpdateCheckFinished(ProgramUpdater *updater, const bool i
             m_programUpdateTimer->start();
         updater->deleteLater();
     };
+
+#ifdef Q_OS_WIN
+    // OTA builds never prompt or open the website: updates are installed silently.
+    {
+        const ProgramUpdater::OtaStatus ota = updater->otaStatus();
+        QString text;
+        Log::MsgType msgType = Log::INFO;
+        if (ota.state == u"staged")
+        {
+            text = tr("qBittorrent %1 has been downloaded and verified. It will be installed automatically after qBittorrent exits.").arg(ota.availableVersion);
+            m_ui->actionCheckForUpdates->setText(tr("Update %1 Ready (Installs on Exit)").arg(ota.availableVersion));
+        }
+        else if (ota.state == u"uptodate")
+        {
+            text = tr("qBittorrent is up to date (%1).").arg(ota.installedVersion.isEmpty() ? QStringLiteral(QBT_VERSION) : ota.installedVersion);
+        }
+        else if (ota.state == u"disabled")
+        {
+            text = tr("Automatic updates are disabled.");
+        }
+        else
+        {
+            text = tr("Automatic update check failed: %1").arg(ota.message.isEmpty() ? tr("the update service did not respond") : ota.message);
+            msgType = Log::WARNING;
+        }
+
+        LogMsg(text, msgType);
+        if (invokedByUser)
+        {
+            auto *msgBox = new QMessageBox {((msgType == Log::WARNING) ? QMessageBox::Warning : QMessageBox::Information)
+                , u"qBittorrent"_s, text, QMessageBox::Ok, this};
+            msgBox->setAttribute(Qt::WA_DeleteOnClose);
+            msgBox->setWindowModality(Qt::NonModal);
+            msgBox->show();
+        }
+        cleanup();
+        return;
+    }
+#endif
 
     const ProgramUpdater::Version newVersion = updater->getNewVersion();
     if (newVersion.isValid())

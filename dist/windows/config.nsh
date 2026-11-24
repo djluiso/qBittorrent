@@ -58,6 +58,7 @@
 !endif
 
 !define /ifndef QBT_DIST_DIR "qBittorrent"
+
 !define /ifndef QBT_NSIS_PLUGINS_DIR "NSISPlugins"
 
 Unicode true

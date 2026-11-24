@@ -273,8 +273,15 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_sources(qbt_base PRIVATE
         utils/reg.h
         utils/reg.cpp
+        ota_win.h
+        ota_win.cpp
     )
-    target_link_libraries(qbt_base PRIVATE iphlpapi powrprof)
+    target_link_libraries(qbt_base PRIVATE iphlpapi powrprof advapi32 ole32 oleaut32)
+
+    # OTA updates: GitHub "owner/repo" publishing vX.Y.Z-ota.N releases (empty disables OTA)
+    set(QBT_OTA_REPO "" CACHE STRING "GitHub owner/repo that publishes OTA releases")
+    set(QBT_OTA_BUILD "0" CACHE STRING "OTA build number of this build")
+    target_compile_definitions(qbt_base PRIVATE QBT_OTA_REPO="${QBT_OTA_REPO}" QBT_OTA_BUILD=${QBT_OTA_BUILD})
 endif()
 
 if (NOT GUI)
