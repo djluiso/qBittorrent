@@ -1,7 +1,7 @@
 From 1497d5226440e390c999ecd4b49700d3a76eaf3e Mon Sep 17 00:00:00 2001
 From: djluiso <jluis026@gmail.com>
 Date: Tue, 24 Nov 2026 17:59:45 +0800
-Subject: [PATCH] Windows: silent OTA updates from stable releases
+Subject: [PATCH 1/2] Windows: silent OTA updates from stable releases
 
 Replace the update prompt (which opened the website) with built-in OTA updates. The installer runs 'qbittorrent.exe --ota-register' to create a SYSTEM scheduled task that runs 'qbittorrent.exe --ota-update': it checks the OTA repository's latest stable GitHub release, downloads the installer into an admin-only folder, verifies its SHA-256 and installs it silently once qBittorrent exits. The app triggers the task on startup, periodically, on demand and on exit, and shows its status. No scripts or extra executables are involved.
 ---

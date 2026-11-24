@@ -1,0 +1,22 @@
+From 360cbadfe5c281f0694f113ce6caf6ae1591eca9 Mon Sep 17 00:00:00 2001
+From: djluiso <jluis026@gmail.com>
+Date: Tue, 24 Nov 2026 18:23:19 +0800
+Subject: [PATCH 2/2] Windows OTA: declare ensureDataDir before use
+
+---
+ src/base/ota_win.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/base/ota_win.cpp b/src/base/ota_win.cpp
+index b909355..dac95c5 100644
+--- a/src/base/ota_win.cpp
++++ b/src/base/ota_win.cpp
+@@ -81,6 +81,8 @@ namespace
+     const int WAIT_FOR_EXIT_SECS = 90;
+     const int MAX_INSTALL_ATTEMPTS = 3;
+ 
++    bool ensureDataDir();
++
+     struct Release
+     {
+         QVersionNumber version;
