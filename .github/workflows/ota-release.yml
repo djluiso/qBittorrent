@@ -1,0 +1,370 @@
+name: OTA release
+
+# Builds qBittorrent's latest *stable* upstream release with the OTA patches applied
+# and publishes it here as vX.Y.Z-ota.N, which installed OTA builds update to silently.
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag to build (empty = latest stable release)"
+        required: false
+        default: ""
+      rebuild:
+        description: "Publish a new OTA build even if this version was already released"
+        type: boolean
+        default: false
+      publish:
+        description: "Publish a GitHub release (untick for a test build)"
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: ota-release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      upstream_tag: ${{ steps.plan.outputs.upstream_tag }}
+      version: ${{ steps.plan.outputs.version }}
+      build: ${{ steps.plan.outputs.build }}
+      ota_tag: ${{ steps.plan.outputs.ota_tag }}
+    steps:
+      - name: Keep the schedule alive
+        # GitHub disables scheduled workflows after 60 days without repository activity
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/ota-release.yml/enable" || true
+
+      - name: Decide what to build
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+          REBUILD: ${{ inputs.rebuild }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag=$(gh api repos/qbittorrent/qBittorrent/releases/latest --jq 'select(.draft == false and .prerelease == false) | .tag_name')
+          fi
+          if [[ ! "$tag" =~ ^release-([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::'$tag' is not a stable upstream release tag"
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          last=$(gh release list -R "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' \
+            | grep -E "^v${version//./\\.}-ota\.[0-9]+$" | sed -E 's/.*-ota\.//' | sort -n | tail -n 1 || true)
+          if [ -n "$last" ] && [ "${REBUILD:-false}" != "true" ]; then
+            echo "v${version}-ota.${last} is already released; nothing to do."
+            echo "build=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          build=$(( ${last:-0} + 1 ))
+          echo "Building upstream $tag as v${version}-ota.${build}"
+          {
+            echo "upstream_tag=$tag"
+            echo "version=$version"
+            echo "build=$build"
+            echo "ota_tag=v${version}-ota.${build}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build != ''
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      boost_path: "${{ github.workspace }}/../boost"
+      libtorrent_path: "${{ github.workspace }}/../libtorrent"
+      vcpkg_path: "c:/vcpkg"
+      arch: x64
+      triplet: x64-windows-static-md-release
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - name: Checkout OTA patches
+        uses: actions/checkout@v4
+        with:
+          path: ota
+          persist-credentials: false
+
+      - name: Checkout upstream ${{ needs.plan.outputs.upstream_tag }}
+        uses: actions/checkout@v4
+        with:
+          repository: qbittorrent/qBittorrent
+          ref: ${{ needs.plan.outputs.upstream_tag }}
+          path: src
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Apply OTA patches
+        run: |
+          $patches = (Get-ChildItem ../ota/patches/*.patch | Sort-Object Name).FullName
+          git -c user.name="qBittorrent OTA" -c user.email="ota@users.noreply.github.com" am --3way $patches
+          if ($LASTEXITCODE -ne 0)
+          {
+            git am --show-current-patch=diff
+            Write-Output "::error::The OTA patch no longer applies to ${{ needs.plan.outputs.upstream_tag }}; it needs to be rebased."
+            exit 1
+          }
+
+      - name: Read dependency versions from upstream CI
+        id: deps
+        shell: python
+        working-directory: src
+        run: |
+          import os, subprocess, sys
+          subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pyyaml"], check=True)
+          import yaml
+          wf = yaml.safe_load(open(".github/workflows/ci_windows.yaml", encoding="utf-8"))
+          job = wf["jobs"]["ci"]
+          lt = job["strategy"]["matrix"]["libtorrent"][0]
+          qt = next(s["with"] for s in job["steps"] if "install-qt-action" in s.get("uses", ""))
+          values = {
+              "libtorrent": lt["version"],
+              "boost": f'{lt["boost_major_version"]}.{lt["boost_minor_version"]}.{lt["boost_patch_version"]}',
+              "boost_us": f'{lt["boost_major_version"]}_{lt["boost_minor_version"]}_{lt["boost_patch_version"]}',
+              "qt_version": qt["version"],
+              "qt_archives": qt.get("archives", ""),
+              "qt_modules": qt.get("modules", ""),
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              for key, value in values.items():
+                  print(f"{key}={value}")
+                  out.write(f"{key}={value}\n")
+
+      - name: Setup devcmd
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: ${{ env.arch }}
+
+      - name: Install build tools
+        run: |
+          if ((Get-Command "ninja.exe" -ErrorAction SilentlyContinue) -eq $null)
+          {
+            choco install ninja
+          }
+          ninja --version
+
+      # https://learn.microsoft.com/en-us/vcpkg/users/binarycaching#gha
+      - name: Set variables for vcpkg
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', (process.env.ACTIONS_CACHE_URL || ''));
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', (process.env.ACTIONS_RUNTIME_TOKEN || ''));
+
+      - name: Install dependencies with vcpkg
+        run: |
+          $triplet = "${{ env.vcpkg_path }}/triplets_overlay/${{ env.triplet }}.cmake"
+          New-Item -Force -ItemType File -Path $triplet
+          Add-Content -Path $triplet -Value @(
+            "set(VCPKG_TARGET_ARCHITECTURE ${{ env.arch }})",
+            "set(VCPKG_LIBRARY_LINKAGE static)",
+            "set(VCPKG_CRT_LINKAGE dynamic)",
+            "set(VCPKG_BUILD_TYPE release)")
+          $packages = "boost-build:${{ env.triplet }}", "openssl:${{ env.triplet }}", "zlib:${{ env.triplet }}"
+          ${{ env.vcpkg_path }}/vcpkg.exe upgrade --no-dry-run --overlay-triplets="${{ env.vcpkg_path }}/triplets_overlay"
+          ${{ env.vcpkg_path }}/vcpkg.exe install `
+            --binarysource="clear;x-gha,readwrite" `
+            --clean-after-build `
+            --overlay-triplets="${{ env.vcpkg_path }}/triplets_overlay" `
+            $packages
+
+      - name: Install boost ${{ steps.deps.outputs.boost }}
+        run: |
+          $v = "${{ steps.deps.outputs.boost }}"; $u = "${{ steps.deps.outputs.boost_us }}"
+          curl -L -o "${{ runner.temp }}/boost.tar.gz" "https://archives.boost.io/release/$v/source/boost_$u.tar.gz"
+          tar -xf "${{ runner.temp }}/boost.tar.gz" -C "${{ github.workspace }}/.."
+          if ($LastExitCode -ne 0)
+          {
+            curl -L -o "${{ runner.temp }}/boost.tar.gz" "https://sourceforge.net/projects/boost/files/boost/$v/boost_$u.tar.gz"
+            tar -xf "${{ runner.temp }}/boost.tar.gz" -C "${{ github.workspace }}/.."
+          }
+          move "${{ github.workspace }}/../boost_*" "${{ env.boost_path }}"
+          cd "${{ env.boost_path }}"
+          ${{ env.vcpkg_path }}/installed/${{ env.triplet }}/tools/boost-build/b2.exe stage toolset=msvc --stagedir=.\ --with-headers
+
+      - name: Install Qt ${{ steps.deps.outputs.qt_version }}
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ steps.deps.outputs.qt_version }}
+          arch: win64_msvc2022_64
+          archives: ${{ steps.deps.outputs.qt_archives }}
+          modules: ${{ steps.deps.outputs.qt_modules }}
+          cache: true
+
+      - name: Install libtorrent ${{ steps.deps.outputs.libtorrent }}
+        run: |
+          git clone --branch v${{ steps.deps.outputs.libtorrent }} --depth 1 --recurse-submodules `
+            https://github.com/arvidn/libtorrent.git ${{ env.libtorrent_path }}
+          cd ${{ env.libtorrent_path }}
+          $env:CFLAGS+=" /guard:cf"
+          $env:CXXFLAGS+=" /guard:cf"
+          $env:LDFLAGS+=" /GUARD:CF"
+          cmake `
+            -B build `
+            -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+            -DCMAKE_CXX_STANDARD=20 `
+            -DCMAKE_INSTALL_PREFIX="${{ env.libtorrent_path }}/install" `
+            -DCMAKE_TOOLCHAIN_FILE="${{ env.vcpkg_path }}/scripts/buildsystems/vcpkg.cmake" `
+            -DBOOST_ROOT="${{ env.boost_path }}/lib/cmake" `
+            -DBUILD_SHARED_LIBS=OFF `
+            -Ddeprecated-functions=OFF `
+            -Dstatic_runtime=OFF `
+            -DVCPKG_TARGET_TRIPLET=${{ env.triplet }}
+          cmake --build build
+          cmake --install build
+
+      - name: Build qBittorrent (OTA build ${{ needs.plan.outputs.build }})
+        run: |
+          cmake `
+            -B build `
+            -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+            -DCMAKE_TOOLCHAIN_FILE="${{ env.vcpkg_path }}/scripts/buildsystems/vcpkg.cmake" `
+            -DBOOST_ROOT="${{ env.boost_path }}/lib/cmake" `
+            -DLibtorrentRasterbar_DIR="${{ env.libtorrent_path }}/install/lib/cmake/LibtorrentRasterbar" `
+            -DMSVC_RUNTIME_DYNAMIC=ON `
+            -DVCPKG_TARGET_TRIPLET=${{ env.triplet }} `
+            -DQBT_OTA_REPO="${{ github.repository }}" `
+            -DQBT_OTA_BUILD=${{ needs.plan.outputs.build }}
+          cmake --build build
+
+      - name: Prepare files for the installer
+        run: |
+          $d = "upload/qBittorrent"
+          New-Item -ItemType Directory -Force $d | Out-Null
+          copy build/qbittorrent.exe $d
+          copy build/qbittorrent.pdb $d
+          copy dist/windows/qt.conf $d
+          $qt = "${{ env.QT_ROOT_DIR }}"
+          foreach ($m in "Core", "Gui", "Network", "Sql", "Svg", "Widgets", "Xml") { copy "$qt/bin/Qt6$m.dll" $d }
+          $plugins = @{
+            "iconengines"  = @("qsvgicon.dll")
+            "imageformats" = @("qgif.dll", "qicns.dll", "qico.dll", "qjpeg.dll", "qsvg.dll", "qtga.dll", "qtiff.dll", "qwbmp.dll", "qwebp.dll")
+            "platforms"    = @("qwindows.dll")
+            "sqldrivers"   = @("qsqlite.dll")
+            "styles"       = @("qmodernwindowsstyle.dll")
+            "tls"          = @("qschannelbackend.dll")
+          }
+          foreach ($dir in $plugins.Keys) {
+            New-Item -ItemType Directory -Force "$d/plugins/$dir" | Out-Null
+            foreach ($f in $plugins[$dir]) { copy "$qt/plugins/$dir/$f" "$d/plugins/$dir" }
+          }
+          # App-local Visual C++ runtime, so the build also runs on PCs without the VC++ redistributable
+          $redistRoot = $env:VCToolsRedistDir
+          if (-not $redistRoot) {
+            $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+            $redistRoot = (Get-ChildItem "$vs\VC\Redist\MSVC" -Directory | Sort-Object Name | Select-Object -Last 1).FullName
+          }
+          $crt = Get-ChildItem "$redistRoot\x64" -Directory -Filter "Microsoft.VC*.CRT" | Select-Object -First 1
+          copy "$($crt.FullName)\*.dll" $d
+          Get-ChildItem $d -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Check that every bundled binary's DLLs are present
+        run: |
+          $d = "upload/qBittorrent"
+          $present = (Get-ChildItem $d -Recurse -Filter *.dll).Name
+          $missing = @()
+          foreach ($bin in Get-ChildItem $d -Recurse -Include *.exe, *.dll) {
+            $deps = dumpbin /nologo /dependents $bin.FullName | Where-Object { $_ -match '^\s+(\S+\.dll)\s*$' } | ForEach-Object { $Matches[1] }
+            foreach ($dep in $deps) {
+              if ($dep -match '^(Qt6|vcruntime|msvcp|concrt)' -and $dep -notin $present) { $missing += "$($bin.Name) -> $dep" }
+            }
+          }
+          if ($missing) { $missing; exit 1 }
+          "All Qt and C++ runtime dependencies are bundled."
+
+      - name: Smoke-test the OTA modes
+        run: |
+          $exe = (Resolve-Path "upload/qBittorrent/qbittorrent.exe").Path
+          $data = "$env:ProgramData\qBittorrentOTA"
+          $p = Start-Process $exe -ArgumentList "--ota-register" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { "--ota-register failed: $($p.ExitCode)"; exit 1 }
+          schtasks /Query /TN "qBittorrent OTA Update" /V /FO LIST
+          if ($LASTEXITCODE -ne 0) { "Task was not registered"; exit 1 }
+          # The freshly built version is never older than the published one, so this only checks.
+          $p = Start-Process $exe -ArgumentList "--ota-update" -Wait -PassThru
+          "--ota-update exit code: $($p.ExitCode)"
+          Get-Content "$data\ota.log"
+          $status = Get-Content "$data\status.json" -Raw | ConvertFrom-Json
+          $status
+          if ($status.state -notin "uptodate", "error") { "Unexpected OTA state"; exit 1 }
+          $p = Start-Process $exe -ArgumentList "--ota-unregister" -Wait -PassThru
+          schtasks /Query /TN "qBittorrent OTA Update" 2>$null
+          if ($LASTEXITCODE -eq 0) { "Task was not removed"; exit 1 }
+          exit 0
+
+      - name: Install NSIS
+        uses: repolevedavaj/install-nsis@65a75ea79c3d1ddde868e98b7f9447e2e623401c # v1.3.0
+        with:
+          nsis-version: "3.12"
+
+      - name: Create installer
+        run: |
+          7z x -o"dist/windows/" "dist/windows/NSISPlugins.zip"
+          makensis `
+            /DQBT_CPU_ARCH="${{ env.arch }}" `
+            /DQBT_DIST_DIR="../../upload/qBittorrent" `
+            /WX `
+            dist/windows/qbittorrent.nsi
+          Get-ChildItem dist/windows/qbittorrent_*_setup.exe
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: src/dist/windows/qbittorrent_*_setup.exe
+          if-no-files-found: error
+
+  release:
+    needs: [plan, build]
+    if: needs.plan.outputs.build != '' && (github.event_name == 'schedule' || inputs.publish)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download installer
+        uses: actions/download-artifact@v4
+        with:
+          name: installer
+          path: dist
+
+      - name: Publish ${{ needs.plan.outputs.ota_tag }}
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OTA_TAG: ${{ needs.plan.outputs.ota_tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          BUILD: ${{ needs.plan.outputs.build }}
+          UPSTREAM_TAG: ${{ needs.plan.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          sha256sum qbittorrent_*_setup.exe > SHA256SUMS
+          cat SHA256SUMS
+          notes="qBittorrent ${VERSION} (upstream [${UPSTREAM_TAG}](https://github.com/qbittorrent/qBittorrent/releases/tag/${UPSTREAM_TAG})) with silent OTA updates, OTA build ${BUILD}.
+
+          Installed OTA builds update to this release automatically. For a first install, download \`qbittorrent_${VERSION}_x64_setup.exe\` below."
+          gh release create "$OTA_TAG" qbittorrent_*_setup.exe SHA256SUMS \
+            -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "qBittorrent ${VERSION} (OTA build ${BUILD})" \
+            --notes "$notes" \
+            --latest

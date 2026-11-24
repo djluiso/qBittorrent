@@ -1,0 +1,1242 @@
+From 1497d5226440e390c999ecd4b49700d3a76eaf3e Mon Sep 17 00:00:00 2001
+From: djluiso <jluis026@gmail.com>
+Date: Tue, 24 Nov 2026 17:59:45 +0800
+Subject: [PATCH] Windows: silent OTA updates from stable releases
+
+Replace the update prompt (which opened the website) with built-in OTA updates. The installer runs 'qbittorrent.exe --ota-register' to create a SYSTEM scheduled task that runs 'qbittorrent.exe --ota-update': it checks the OTA repository's latest stable GitHub release, downloads the installer into an admin-only folder, verifies its SHA-256 and installs it silently once qBittorrent exits. The app triggers the task on startup, periodically, on demand and on exit, and shows its status. No scripts or extra executables are involved.
+---
+ dist/windows/config.nsh        |   1 +
+ dist/windows/installer.nsh     |  18 +
+ dist/windows/uninstaller.nsh   |   8 +
+ src/app/main.cpp               |  10 +
+ src/base/CMakeLists.txt        |   9 +-
+ src/base/ota_win.cpp           | 712 +++++++++++++++++++++++++++++++++
+ src/base/ota_win.h             |  51 +++
+ src/base/preferences.cpp       |  11 +-
+ src/gui/CMakeLists.txt         |   2 +-
+ src/gui/mainwindow.cpp         |  45 +++
+ src/gui/optionsdialog.cpp      |   3 +
+ src/gui/programupdater.h       |  19 +
+ src/gui/programupdater_win.cpp | 151 +++++++
+ 13 files changed, 1036 insertions(+), 4 deletions(-)
+ create mode 100644 src/base/ota_win.cpp
+ create mode 100644 src/base/ota_win.h
+ create mode 100644 src/gui/programupdater_win.cpp
+
+diff --git a/dist/windows/config.nsh b/dist/windows/config.nsh
+index 8587e91..e8c1a05 100644
+--- a/dist/windows/config.nsh
++++ b/dist/windows/config.nsh
+@@ -58,6 +58,7 @@
+ !endif
+ 
+ !define /ifndef QBT_DIST_DIR "qBittorrent"
++
+ !define /ifndef QBT_NSIS_PLUGINS_DIR "NSISPlugins"
+ 
+ Unicode true
+diff --git a/dist/windows/installer.nsh b/dist/windows/installer.nsh
+index 5319c78..0c96a5e 100644
+--- a/dist/windows/installer.nsh
++++ b/dist/windows/installer.nsh
+@@ -1,7 +1,15 @@
+ Var uninstallerPath
++Var otaHadDesktopLnk
+ 
+ Section "-hidden"
+ 
++    ; OTA: the previous uninstaller removes the desktop shortcut; remember it to restore it.
++    ${If} ${FileExists} "$DESKTOP\qBittorrent.lnk"
++      StrCpy $otaHadDesktopLnk "1"
++    ${EndIf}
++    ; Tell the previous uninstaller this is an upgrade, so it keeps the OTA task.
++    System::Call 'Kernel32::SetEnvironmentVariable(t "QBT_OTA_UPGRADE", t "1")i'
++
+     ;Search if qBittorrent is already installed.
+     FindFirst $0 $1 "$uninstallerPath\uninst.exe"
+     FindClose $0
+@@ -63,6 +71,9 @@ Section $(inst_qbt_req) ;"qBittorrent (required)"
+   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\qBittorrent" "NoModify" 1
+   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\qBittorrent" "NoRepair" 1
+   WriteUninstaller "uninst.exe"
++
++  ; OTA: register the SYSTEM task that silently installs stable updates (qbittorrent.exe --ota-update)
++  ExecWait '"$INSTDIR\qbittorrent.exe" --ota-register'
+   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+   IntFmt $0 "0x%08X" $0
+   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\qBittorrent" "EstimatedSize" "$0"
+@@ -76,6 +87,13 @@ Section /o $(inst_desktop) ;"Create Desktop Shortcut"
+ 
+ SectionEnd
+ 
++Section "-ota_restore_desktop"
++  ${If} $otaHadDesktopLnk == "1"
++  ${AndIfNot} ${FileExists} "$DESKTOP\qBittorrent.lnk"
++    CreateShortCut "$DESKTOP\qBittorrent.lnk" "$INSTDIR\qbittorrent.exe"
++  ${EndIf}
++SectionEnd
++
+ Section $(inst_startmenu) ;"Create Start Menu Shortcut"
+ 
+   CreateDirectory "$SMPROGRAMS\qBittorrent"
+diff --git a/dist/windows/uninstaller.nsh b/dist/windows/uninstaller.nsh
+index 6d94091..e110223 100644
+--- a/dist/windows/uninstaller.nsh
++++ b/dist/windows/uninstaller.nsh
+@@ -1,3 +1,11 @@
++Section "-un.ota"
++  ; Remove the OTA task, unless the uninstaller runs as part of an upgrade
++  ReadEnvStr $0 "QBT_OTA_UPGRADE"
++  ${If} $0 != "1"
++    ExecWait '"$INSTDIR\qbittorrent.exe" --ota-unregister'
++  ${EndIf}
++SectionEnd
++
+ Section "un.$(remove_files)" ;"un.Remove files"
+   SectionIn RO
+ 
+diff --git a/src/app/main.cpp b/src/app/main.cpp
+index c844ea4..7ad4332 100644
+--- a/src/app/main.cpp
++++ b/src/app/main.cpp
+@@ -71,6 +71,10 @@ Q_IMPORT_PLUGIN(QICOPlugin)
+ #include "base/profile.h"
+ #include "base/settingvalue.h"
+ #include "base/version.h"
++
++#ifdef Q_OS_WIN
++#include "base/ota_win.h"
++#endif
+ #include "application.h"
+ #include "cmdoptions.h"
+ #include "legalnotice.h"
+@@ -178,6 +182,12 @@ namespace
+ // Main
+ int main(int argc, char *argv[])
+ {
++#ifdef Q_OS_WIN
++    // Windowless OTA update modes used by the installer and the "qBittorrent OTA Update" task
++    if (const int otaResult = Ota::runCommand(argc, argv); otaResult >= 0)
++        return otaResult;
++#endif
++
+ #ifdef DISABLE_GUI
+     setvbuf(stdout, nullptr, _IONBF, 0);
+ #endif
+diff --git a/src/base/CMakeLists.txt b/src/base/CMakeLists.txt
+index 41809ce..7602acc 100644
+--- a/src/base/CMakeLists.txt
++++ b/src/base/CMakeLists.txt
+@@ -273,8 +273,15 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+     target_sources(qbt_base PRIVATE
+         utils/reg.h
+         utils/reg.cpp
++        ota_win.h
++        ota_win.cpp
+     )
+-    target_link_libraries(qbt_base PRIVATE iphlpapi powrprof)
++    target_link_libraries(qbt_base PRIVATE iphlpapi powrprof advapi32 ole32 oleaut32)
++
++    # OTA updates: GitHub "owner/repo" publishing vX.Y.Z-ota.N releases (empty disables OTA)
++    set(QBT_OTA_REPO "" CACHE STRING "GitHub owner/repo that publishes OTA releases")
++    set(QBT_OTA_BUILD "0" CACHE STRING "OTA build number of this build")
++    target_compile_definitions(qbt_base PRIVATE QBT_OTA_REPO="${QBT_OTA_REPO}" QBT_OTA_BUILD=${QBT_OTA_BUILD})
+ endif()
+ 
+ if (NOT GUI)
+diff --git a/src/base/ota_win.cpp b/src/base/ota_win.cpp
+new file mode 100644
+index 0000000..b909355
+--- /dev/null
++++ b/src/base/ota_win.cpp
+@@ -0,0 +1,712 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ * Copyright (C) 2026  qBittorrent OTA contributors
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ * In addition, as a special exception, the copyright holders give permission to
++ * link this program with the OpenSSL project's "OpenSSL" library (or with
++ * modified versions of it that use the same license as the "OpenSSL" library),
++ * and distribute the linked executables. You must obey the GNU General Public
++ * License in all respects for all of the code used other than "OpenSSL".  If you
++ * modify file(s), you may extend this exception to your version of the file(s),
++ * but you are not obligated to do so. If you do not wish to do so, delete this
++ * exception statement from your version.
++ */
++
++#include "ota_win.h"
++
++#include <cstring>
++#include <optional>
++#include <string>
++
++#include <QCoreApplication>
++#include <QCryptographicHash>
++#include <QDateTime>
++#include <QDir>
++#include <QEventLoop>
++#include <QFile>
++#include <QFileInfo>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QNetworkAccessManager>
++#include <QNetworkReply>
++#include <QNetworkRequest>
++#include <QProcess>
++#include <QRegularExpression>
++#include <QSaveFile>
++#include <QSettings>
++#include <QThread>
++#include <QVersionNumber>
++
++#include <windows.h>
++#include <aclapi.h>
++#include <objbase.h>
++#include <oleauto.h>
++#include <sddl.h>
++#include <taskschd.h>
++#include <tlhelp32.h>
++
++#include "base/global.h"
++#include "base/version.h"
++
++#ifndef QBT_OTA_REPO
++#define QBT_OTA_REPO ""
++#endif
++#ifndef QBT_OTA_BUILD
++#define QBT_OTA_BUILD 0
++#endif
++
++namespace
++{
++    const wchar_t TASK_NAME[] = L"qBittorrent OTA Update";
++    // SYSTEM & Administrators: full control; Authenticated Users: read + run
++    const wchar_t TASK_SDDL[] = L"D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;AU)";
++    // SYSTEM & Administrators: full control; Users: read & execute (protected, inherited by children)
++    const wchar_t DATA_DIR_SDDL[] = L"O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
++
++    const int WAIT_FOR_EXIT_SECS = 90;
++    const int MAX_INSTALL_ATTEMPTS = 3;
++
++    struct Release
++    {
++        QVersionNumber version;
++        int build = 0;
++
++        bool isNewerThan(const Release &other) const
++        {
++            const int cmp = QVersionNumber::compare(version, other.version);
++            return (cmp > 0) || ((cmp == 0) && (build > other.build));
++        }
++
++        QString toString() const
++        {
++            return (build > 0)
++                ? u"%1 (OTA build %2)"_s.arg(version.toString(), QString::number(build))
++                : version.toString();
++        }
++    };
++
++    const Release CURRENT_RELEASE {QVersionNumber(QBT_VERSION_MAJOR, QBT_VERSION_MINOR, QBT_VERSION_BUGFIX), QBT_OTA_BUILD};
++
++    QString dataDir()
++    {
++        return qEnvironmentVariable("ProgramData", u"C:\\ProgramData"_s) + u"\\qBittorrentOTA"_s;
++    }
++
++    QString stageDir()
++    {
++        return dataDir() + u"\\staged"_s;
++    }
++
++    void writeLog(const QString &message)
++    {
++        const QString path = dataDir() + u"\\ota.log"_s;
++        if (QFileInfo(path).size() > (1024 * 1024))
++        {
++            QFile::remove(path + u".old"_s);
++            QFile::rename(path, (path + u".old"_s));
++        }
++        QFile file {path};
++        if (file.open(QIODevice::Append | QIODevice::Text))
++            file.write((QDateTime::currentDateTime().toString(u"yyyy-MM-dd HH:mm:ss"_s) + u"  "_s + message + u'\n').toUtf8());
++    }
++
++    void setStatus(const QString &state, const QString &available = {}, const QString &message = {}
++        , const Release &installed = CURRENT_RELEASE)
++    {
++        const QJsonObject obj {
++            {u"state"_s, state},
++            {u"installed"_s, installed.toString()},
++            {u"available"_s, available},
++            {u"message"_s, message},
++            {u"updatedAt"_s, QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}
++        };
++        QSaveFile file {Ota::statusFilePath()};
++        if (file.open(QIODevice::WriteOnly))
++        {
++            file.write(QJsonDocument(obj).toJson(QJsonDocument::Compact));
++            file.commit();
++        }
++        writeLog(u"status=%1 %2 %3"_s.arg(state, available, message));
++    }
++
++    // Honour the in-app setting "Automatically download and install updates" of every local profile.
++    bool isDisabledByUser()
++    {
++        const QSettings profileList {u"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList"_s, QSettings::NativeFormat};
++        for (const QString &sid : profileList.childGroups())
++        {
++            const QString profileDir = profileList.value(sid + u"/ProfileImagePath"_s).toString();
++            if (profileDir.isEmpty())
++                continue;
++
++            const QString iniPath = profileDir + u"\\AppData\\Roaming\\qBittorrent\\qBittorrent.ini"_s;
++            if (!QFile::exists(iniPath))
++                continue;
++
++            const QSettings ini {iniPath, QSettings::IniFormat};
++            if (!ini.value(u"Preferences/Advanced/otaUpdates"_s, true).toBool())
++                return true;
++        }
++        return false;
++    }
++
++    bool isOtherInstanceRunning()
++    {
++        bool found = false;
++        const HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
++        if (snapshot == INVALID_HANDLE_VALUE)
++            return false;
++
++        PROCESSENTRY32W entry {};
++        entry.dwSize = sizeof(entry);
++        const DWORD selfPid = ::GetCurrentProcessId();
++        for (BOOL ok = ::Process32FirstW(snapshot, &entry); ok; ok = ::Process32NextW(snapshot, &entry))
++        {
++            if ((entry.th32ProcessID != selfPid) && (_wcsicmp(entry.szExeFile, L"qbittorrent.exe") == 0))
++            {
++                found = true;
++                break;
++            }
++        }
++        ::CloseHandle(snapshot);
++        return found;
++    }
++
++    // ---- networking (synchronous, this mode has no UI) ----
++
++    QNetworkRequest makeRequest(const QString &url)
++    {
++        QNetworkRequest request {QUrl(url)};
++        request.setHeader(QNetworkRequest::UserAgentHeader, u"qBittorrent-OTA/" QBT_VERSION_2 ""_s);
++        request.setRawHeader("Accept", "application/vnd.github+json");
++        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
++        request.setTransferTimeout(60000);
++        return request;
++    }
++
++    std::optional<QByteArray> httpGet(QNetworkAccessManager &nam, const QString &url, QString &error)
++    {
++        QNetworkReply *reply = nam.get(makeRequest(url));
++        QEventLoop loop;
++        QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
++        loop.exec();
++        reply->deleteLater();
++        if (reply->error() != QNetworkReply::NoError)
++        {
++            error = reply->errorString();
++            return std::nullopt;
++        }
++        return reply->readAll();
++    }
++
++    bool httpDownload(QNetworkAccessManager &nam, const QString &url, const QString &path, QString &error)
++    {
++        QFile file {path};
++        if (!file.open(QIODevice::WriteOnly))
++        {
++            error = file.errorString();
++            return false;
++        }
++
++        QNetworkReply *reply = nam.get(makeRequest(url));
++        QEventLoop loop;
++        QObject::connect(reply, &QNetworkReply::readyRead, &loop, [reply, &file]() { file.write(reply->readAll()); });
++        QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
++        loop.exec();
++        file.write(reply->readAll());
++        file.close();
++        reply->deleteLater();
++        if (reply->error() != QNetworkReply::NoError)
++        {
++            error = reply->errorString();
++            return false;
++        }
++        return true;
++    }
++
++    QString sha256OfFile(const QString &path)
++    {
++        QFile file {path};
++        if (!file.open(QIODevice::ReadOnly))
++            return {};
++        QCryptographicHash hash {QCryptographicHash::Sha256};
++        hash.addData(&file);
++        return QString::fromLatin1(hash.result().toHex());
++    }
++
++    // ---- staged update ----
++
++    struct Staged
++    {
++        Release release;
++        QString filePath;
++        QJsonObject info;
++    };
++
++    void removeStaged()
++    {
++        QDir(stageDir()).removeRecursively();
++    }
++
++    void saveStagedInfo(const QJsonObject &info)
++    {
++        QSaveFile file {stageDir() + u"\\info.json"_s};
++        if (file.open(QIODevice::WriteOnly))
++        {
++            file.write(QJsonDocument(info).toJson(QJsonDocument::Compact));
++            file.commit();
++        }
++    }
++
++    std::optional<Staged> loadStaged()
++    {
++        QFile file {stageDir() + u"\\info.json"_s};
++        if (!file.open(QIODevice::ReadOnly))
++            return std::nullopt;
++
++        const QJsonObject info = QJsonDocument::fromJson(file.readAll()).object();
++        file.close();
++        Staged staged {
++            {QVersionNumber::fromString(info[u"version"_s].toString()), info[u"build"_s].toInt()},
++            (stageDir() + u'\\' + info[u"file"_s].toString()),
++            info
++        };
++        const QString expected = info[u"sha256"_s].toString();
++        if (staged.release.version.isNull() || expected.isEmpty()
++            || (sha256OfFile(staged.filePath).compare(expected, Qt::CaseInsensitive) != 0))
++        {
++            writeLog(u"Discarding invalid staged update."_s);
++            removeStaged();
++            return std::nullopt;
++        }
++        return staged;
++    }
++
++    QString expectedSha256(QNetworkAccessManager &nam, const QJsonObject &releaseObj, const QJsonObject &asset, QString &error)
++    {
++        const QRegularExpressionMatch digest = QRegularExpression(u"^sha256:([0-9a-fA-F]{64})$"_s).match(asset[u"digest"_s].toString());
++        if (digest.hasMatch())
++            return digest.captured(1).toLower();
++
++        const QJsonArray assets = releaseObj[u"assets"_s].toArray();
++        for (const QJsonValue &value : assets)
++        {
++            const QJsonObject sums = value.toObject();
++            if (sums[u"name"_s].toString() != u"SHA256SUMS")
++                continue;
++
++            const auto data = httpGet(nam, sums[u"browser_download_url"_s].toString(), error);
++            if (!data)
++                return {};
++            const QRegularExpression lineRegex {u"^([0-9a-fA-F]{64})\\s+\\*?(\\S+)\\s*$"_s, QRegularExpression::MultilineOption};
++            for (const QRegularExpressionMatch &m : lineRegex.globalMatch(QString::fromUtf8(*data)))
++            {
++                if (m.captured(2) == asset[u"name"_s].toString())
++                    return m.captured(1).toLower();
++            }
++        }
++        error = u"No SHA-256 is published for %1."_s.arg(asset[u"name"_s].toString());
++        return {};
++    }
++
++    bool launchInstallerAfterExit(const QString &installerPath)
++    {
++        // The installer replaces qbittorrent.exe, which is the image of this very process,
++        // so start it detached after a short delay that lets this process exit first.
++        QProcess proc;
++        proc.setProgram(qEnvironmentVariable("ComSpec", u"C:\\Windows\\System32\\cmd.exe"_s));
++        proc.setNativeArguments(u"/d /c \"ping -n 6 127.0.0.1 >nul & \"%1\" /S\""_s.arg(QDir::toNativeSeparators(installerPath)));
++        proc.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *args)
++        {
++            args->flags |= CREATE_NO_WINDOW;
++        });
++        proc.setStandardOutputFile(QProcess::nullDevice());
++        proc.setStandardErrorFile(QProcess::nullDevice());
++        return proc.startDetached();
++    }
++
++    // ---- commands ----
++
++    int runUpdate()
++    {
++        if (!ensureDataDir())
++            return 2;
++
++        if (std::strlen(QBT_OTA_REPO) == 0)
++        {
++            setStatus(u"disabled"_s, {}, u"This build has no OTA update source."_s);
++            return 0;
++        }
++        if (isDisabledByUser())
++        {
++            removeStaged();
++            setStatus(u"disabled"_s, {}, u"Automatic updates are turned off in qBittorrent options."_s);
++            return 0;
++        }
++
++        setStatus(u"checking"_s);
++
++        std::optional<Staged> staged = loadStaged();
++        if (staged && !staged->release.isNewerThan(CURRENT_RELEASE))
++        {
++            // Either the staged update has been installed (this is the new binary), or it is obsolete.
++            writeLog(u"Running %1; removing staged %2."_s.arg(CURRENT_RELEASE.toString(), staged->release.toString()));
++            removeStaged();
++            staged.reset();
++        }
++
++        QNetworkAccessManager nam;
++        QString error;
++        const auto releaseData = httpGet(nam, u"https://api.github.com/repos/" QBT_OTA_REPO "/releases/latest"_s, error);
++        if (releaseData)
++        {
++            const QJsonObject releaseObj = QJsonDocument::fromJson(*releaseData).object();
++            const QString tag = releaseObj[u"tag_name"_s].toString();
++            const QRegularExpressionMatch m = QRegularExpression(u"^v(\\d+\\.\\d+\\.\\d+)-ota\\.(\\d+)$"_s).match(tag);
++            if (!releaseObj[u"draft"_s].toBool() && !releaseObj[u"prerelease"_s].toBool() && m.hasMatch())
++            {
++                const Release candidate {QVersionNumber::fromString(m.captured(1)), m.captured(2).toInt()};
++                if (candidate.isNewerThan(CURRENT_RELEASE) && (!staged || candidate.isNewerThan(staged->release)))
++                {
++                    const QString assetName = u"qbittorrent_%1_x64_setup.exe"_s.arg(m.captured(1));
++                    QJsonObject asset;
++                    const QJsonArray assets = releaseObj[u"assets"_s].toArray();
++                    for (const QJsonValue &value : assets)
++                    {
++                        if (value.toObject()[u"name"_s].toString() == assetName)
++                            asset = value.toObject();
++                    }
++                    if (asset.isEmpty())
++                    {
++                        setStatus(u"error"_s, candidate.toString(), u"Release %1 has no %2."_s.arg(tag, assetName));
++                        return 1;
++                    }
++
++                    const QString expected = expectedSha256(nam, releaseObj, asset, error);
++                    if (expected.isEmpty())
++                    {
++                        setStatus(u"error"_s, candidate.toString(), error);
++                        return 1;
++                    }
++
++                    setStatus(u"downloading"_s, candidate.toString());
++                    removeStaged();
++                    QDir().mkpath(stageDir());
++                    const QString filePath = stageDir() + u'\\' + assetName;
++                    if (!httpDownload(nam, asset[u"browser_download_url"_s].toString(), filePath, error))
++                    {
++                        removeStaged();
++                        setStatus(u"error"_s, candidate.toString(), u"Download failed: %1"_s.arg(error));
++                        return 1;
++                    }
++                    const QString actual = sha256OfFile(filePath);
++                    if (actual.compare(expected, Qt::CaseInsensitive) != 0)
++                    {
++                        removeStaged();
++                        setStatus(u"error"_s, candidate.toString(), u"SHA-256 mismatch for %1 (got %2, expected %3)."_s.arg(assetName, actual, expected));
++                        return 1;
++                    }
++                    writeLog(u"Downloaded and verified %1 (%2) from %3."_s.arg(assetName, actual, tag));
++                    saveStagedInfo({
++                        {u"tag"_s, tag},
++                        {u"version"_s, candidate.version.toString()},
++                        {u"build"_s, candidate.build},
++                        {u"file"_s, assetName},
++                        {u"sha256"_s, actual},
++                        {u"attempts"_s, 0}
++                    });
++                    staged = loadStaged();
++                }
++            }
++            else
++            {
++                writeLog(u"Ignoring latest release '%1' (not a stable OTA release)."_s.arg(tag));
++            }
++        }
++        else if (!staged)
++        {
++            setStatus(u"error"_s, {}, u"Could not reach GitHub to check for updates: %1"_s.arg(error));
++            return 1;
++        }
++
++        if (!staged)
++        {
++            setStatus(u"uptodate"_s);
++            return 0;
++        }
++
++        const QString available = staged->release.toString();
++        setStatus(u"staged"_s, available, u"Will be installed automatically after qBittorrent exits."_s);
++
++        for (int i = 0; (i < WAIT_FOR_EXIT_SECS) && isOtherInstanceRunning(); i += 2)
++            QThread::sleep(2);
++        if (isOtherInstanceRunning())
++        {
++            writeLog(u"qBittorrent is still running; the update stays staged."_s);
++            return 0;
++        }
++
++        const int attempts = staged->info[u"attempts"_s].toInt() + 1;
++        if (attempts > MAX_INSTALL_ATTEMPTS)
++        {
++            removeStaged();
++            setStatus(u"error"_s, available, u"Installing the update failed %1 times; it will be downloaded again."_s.arg(MAX_INSTALL_ATTEMPTS));
++            return 1;
++        }
++        staged->info[u"attempts"_s] = attempts;
++        saveStagedInfo(staged->info);
++
++        if (!launchInstallerAfterExit(staged->filePath))
++        {
++            setStatus(u"error"_s, available, u"Could not start the installer."_s);
++            return 1;
++        }
++        // The next run (qBittorrent triggers one on startup) confirms the new version.
++        setStatus(u"installing"_s, available, u"Installing silently (attempt %1)."_s.arg(attempts));
++        return 0;
++    }
++
++    template <typename T>
++    void releaseCom(T *&ptr)
++    {
++        if (ptr)
++        {
++            ptr->Release();
++            ptr = nullptr;
++        }
++    }
++
++    class ComScope
++    {
++    public:
++        ComScope() : m_hr {::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)} {}
++        ~ComScope()
++        {
++            if (SUCCEEDED(m_hr))
++                ::CoUninitialize();
++        }
++
++    private:
++        HRESULT m_hr;
++    };
++
++    ITaskFolder *openRootTaskFolder()
++    {
++        ITaskService *service = nullptr;
++        if (FAILED(::CoCreateInstance(__uuidof(TaskScheduler), nullptr, CLSCTX_INPROC_SERVER, __uuidof(ITaskService), reinterpret_cast<void **>(&service))))
++            return nullptr;
++
++        VARIANT empty;
++        ::VariantInit(&empty);
++        ITaskFolder *folder = nullptr;
++        BSTR root = ::SysAllocString(L"\\");
++        if (SUCCEEDED(service->Connect(empty, empty, empty, empty)))
++            service->GetFolder(root, &folder);
++        ::SysFreeString(root);
++        releaseCom(service);
++        return folder;
++    }
++
++    QString xmlEscape(QString text)
++    {
++        return text.replace(u'&', u"&amp;"_s).replace(u'<', u"&lt;"_s).replace(u'>', u"&gt;"_s).replace(u'"', u"&quot;"_s);
++    }
++
++    bool isOwnedByAdmins(const std::wstring &path)
++    {
++        PSID owner = nullptr;
++        PSECURITY_DESCRIPTOR sd = nullptr;
++        if (::GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner, nullptr, nullptr, nullptr, &sd) != ERROR_SUCCESS)
++            return false;
++        const bool trusted = ::IsWellKnownSid(owner, WinLocalSystemSid) || ::IsWellKnownSid(owner, WinBuiltinAdministratorsSid);
++        ::LocalFree(sd);
++        return trusted;
++    }
++
++    // The staging folder is executed from as SYSTEM, so it must only ever be writable by admins.
++    // A folder pre-created by someone else is discarded.
++    bool ensureDataDir()
++    {
++        const std::wstring path = QDir::toNativeSeparators(dataDir()).toStdWString();
++        if (QFileInfo::exists(dataDir()) && !isOwnedByAdmins(path))
++        {
++            if (!QDir(dataDir()).removeRecursively())
++                return false;
++        }
++
++        PSECURITY_DESCRIPTOR sd = nullptr;
++        if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(DATA_DIR_SDDL, SDDL_REVISION_1, &sd, nullptr))
++            return false;
++
++        bool ok = false;
++        if (!QFileInfo::exists(dataDir()))
++        {
++            SECURITY_ATTRIBUTES sa {sizeof(SECURITY_ATTRIBUTES), sd, FALSE};
++            ok = ::CreateDirectoryW(path.c_str(), &sa);
++        }
++        else
++        {
++            BOOL daclPresent = FALSE;
++            BOOL daclDefaulted = FALSE;
++            PACL dacl = nullptr;
++            PSID owner = nullptr;
++            BOOL ownerDefaulted = FALSE;
++            ::GetSecurityDescriptorDacl(sd, &daclPresent, &dacl, &daclDefaulted);
++            ::GetSecurityDescriptorOwner(sd, &owner, &ownerDefaulted);
++            ok = (::SetNamedSecurityInfoW(const_cast<wchar_t *>(path.c_str()), SE_FILE_OBJECT
++                , (OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION)
++                , owner, nullptr, dacl, nullptr) == ERROR_SUCCESS);
++        }
++        ::LocalFree(sd);
++        return ok && isOwnedByAdmins(path);
++    }
++
++    int runRegister()
++    {
++        if (!ensureDataDir())
++            return 2;
++
++        const QString exePath = QDir::toNativeSeparators(QCoreApplication::applicationFilePath());
++        const QString xml = uR"(<?xml version="1.0" encoding="UTF-16"?>
++<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
++  <RegistrationInfo>
++    <Description>Checks for, verifies and silently installs stable qBittorrent OTA releases.</Description>
++  </RegistrationInfo>
++  <Triggers>
++    <BootTrigger>
++      <Enabled>true</Enabled>
++      <Delay>PT3M</Delay>
++    </BootTrigger>
++    <CalendarTrigger>
++      <StartBoundary>2020-01-01T00:00:00</StartBoundary>
++      <Enabled>true</Enabled>
++      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
++      <Repetition><Interval>PT6H</Interval><Duration>P1D</Duration></Repetition>
++    </CalendarTrigger>
++  </Triggers>
++  <Principals>
++    <Principal id="Author">
++      <UserId>S-1-5-18</UserId>
++      <RunLevel>HighestAvailable</RunLevel>
++    </Principal>
++  </Principals>
++  <Settings>
++    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
++    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
++    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
++    <StartWhenAvailable>true</StartWhenAvailable>
++    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
++    <Enabled>true</Enabled>
++  </Settings>
++  <Actions Context="Author">
++    <Exec>
++      <Command>"%1"</Command>
++      <Arguments>--ota-update</Arguments>
++    </Exec>
++  </Actions>
++</Task>
++)"_s.arg(xmlEscape(exePath));
++
++        const ComScope com;
++        ITaskFolder *folder = openRootTaskFolder();
++        if (!folder)
++            return 3;
++
++        VARIANT empty;
++        ::VariantInit(&empty);
++        VARIANT sddl;
++        ::VariantInit(&sddl);
++        sddl.vt = VT_BSTR;
++        sddl.bstrVal = ::SysAllocString(TASK_SDDL);
++        BSTR name = ::SysAllocString(TASK_NAME);
++        BSTR xmlText = ::SysAllocString(reinterpret_cast<const wchar_t *>(xml.utf16()));
++        IRegisteredTask *task = nullptr;
++        const HRESULT hr = folder->RegisterTask(name, xmlText, TASK_CREATE_OR_UPDATE, empty, empty
++            , TASK_LOGON_SERVICE_ACCOUNT, sddl, &task);
++        ::SysFreeString(xmlText);
++        ::SysFreeString(name);
++        ::VariantClear(&sddl);
++        releaseCom(task);
++        releaseCom(folder);
++        return SUCCEEDED(hr) ? 0 : 4;
++    }
++
++    int runUnregister()
++    {
++        {
++            const ComScope com;
++            if (ITaskFolder *folder = openRootTaskFolder())
++            {
++                BSTR name = ::SysAllocString(TASK_NAME);
++                folder->DeleteTask(name, 0);
++                ::SysFreeString(name);
++                releaseCom(folder);
++            }
++        }
++        QDir(dataDir()).removeRecursively();
++        return 0;
++    }
++}
++
++QString Ota::statusFilePath()
++{
++    return dataDir() + u"\\status.json"_s;
++}
++
++bool Ota::triggerTask()
++{
++    const ComScope com;
++    ITaskFolder *folder = openRootTaskFolder();
++    if (!folder)
++        return false;
++
++    BSTR name = ::SysAllocString(TASK_NAME);
++    IRegisteredTask *task = nullptr;
++    HRESULT hr = folder->GetTask(name, &task);
++    ::SysFreeString(name);
++    releaseCom(folder);
++    if (FAILED(hr) || !task)
++        return false;
++
++    VARIANT empty;
++    ::VariantInit(&empty);
++    IRunningTask *running = nullptr;
++    hr = task->Run(empty, &running);
++    releaseCom(running);
++    releaseCom(task);
++    return SUCCEEDED(hr);
++}
++
++int Ota::runCommand(int argc, char *argv[])
++{
++    if (argc != 2)
++        return -1;
++
++    int (*command)() = nullptr;
++    if (std::strcmp(argv[1], "--ota-update") == 0)
++        command = runUpdate;
++    else if (std::strcmp(argv[1], "--ota-register") == 0)
++        command = runRegister;
++    else if (std::strcmp(argv[1], "--ota-unregister") == 0)
++        command = runUnregister;
++    else
++        return -1;
++
++    const QCoreApplication app {argc, argv};
++    return command();
++}
+diff --git a/src/base/ota_win.h b/src/base/ota_win.h
+new file mode 100644
+index 0000000..a9a92c4
+--- /dev/null
++++ b/src/base/ota_win.h
+@@ -0,0 +1,51 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ * Copyright (C) 2026  qBittorrent OTA contributors
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ * In addition, as a special exception, the copyright holders give permission to
++ * link this program with the OpenSSL project's "OpenSSL" library (or with
++ * modified versions of it that use the same license as the "OpenSSL" library),
++ * and distribute the linked executables. You must obey the GNU General Public
++ * License in all respects for all of the code used other than "OpenSSL".  If you
++ * modify file(s), you may extend this exception to your version of the file(s),
++ * but you are not obligated to do so. If you do not wish to do so, delete this
++ * exception statement from your version.
++ */
++
++#pragma once
++
++#include <QString>
++
++// Over-the-air (OTA) updates for Windows.
++//
++// qBittorrent is installed per-machine (Program Files), so installing an update needs admin
++// rights. The installer runs `qbittorrent.exe --ota-register`, which registers the SYSTEM
++// scheduled task "qBittorrent OTA Update" (any signed-in user may run it, only admins may
++// change it). That task runs `qbittorrent.exe --ota-update`, a windowless mode that:
++//   - checks the OTA repository's latest stable GitHub release (vX.Y.Z-ota.N),
++//   - downloads the installer into an admin-only folder and verifies its SHA-256,
++//   - installs it silently (/S) once no qBittorrent window is running.
++// The regular app triggers the task (startup, periodically, on demand, on exit) and reads
++// the task's status from statusFilePath().
++namespace Ota
++{
++    // Returns -1 if `argv` is not an OTA command, otherwise the command's exit code.
++    int runCommand(int argc, char *argv[]);
++
++    bool triggerTask();
++    QString statusFilePath();
++}
+diff --git a/src/base/preferences.cpp b/src/base/preferences.cpp
+index 257de54..fa706ac 100644
+--- a/src/base/preferences.cpp
++++ b/src/base/preferences.cpp
+@@ -1520,9 +1520,16 @@ void Preferences::setPythonExecutablePath(const Path &path)
+ }
+ 
+ #if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
++#ifdef Q_OS_WIN
++// OTA builds use a separate key: "automatically install updates" (also read by the OTA task)
++const QString UPDATE_CHECK_KEY = u"Preferences/Advanced/otaUpdates"_s;
++#else
++const QString UPDATE_CHECK_KEY = u"Preferences/Advanced/updateCheck"_s;
++#endif
++
+ bool Preferences::isUpdateCheckEnabled() const
+ {
+-    return value(u"Preferences/Advanced/updateCheck"_s, true);
++    return value(UPDATE_CHECK_KEY, true);
+ }
+ 
+ void Preferences::setUpdateCheckEnabled(const bool enabled)
+@@ -1530,7 +1537,7 @@ void Preferences::setUpdateCheckEnabled(const bool enabled)
+     if (enabled == isUpdateCheckEnabled())
+         return;
+ 
+-    setValue(u"Preferences/Advanced/updateCheck"_s, enabled);
++    setValue(UPDATE_CHECK_KEY, enabled);
+ }
+ #endif
+ 
+diff --git a/src/gui/CMakeLists.txt b/src/gui/CMakeLists.txt
+index d4a1e70..0e9c91c 100644
+--- a/src/gui/CMakeLists.txt
++++ b/src/gui/CMakeLists.txt
+@@ -332,6 +332,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+         powermanagement/inhibitorwindows.h
+         powermanagement/inhibitorwindows.cpp
+         programupdater.h
+-        programupdater.cpp
++        programupdater_win.cpp
+     )
+ endif()
+diff --git a/src/gui/mainwindow.cpp b/src/gui/mainwindow.cpp
+index f78787e..a5f7865 100644
+--- a/src/gui/mainwindow.cpp
++++ b/src/gui/mainwindow.cpp
+@@ -65,6 +65,7 @@
+ #include "base/bittorrent/session.h"
+ #include "base/bittorrent/sessionstatus.h"
+ #include "base/global.h"
++#include "base/logger.h"
+ #include "base/net/downloadmanager.h"
+ #include "base/path.h"
+ #include "base/plugins/pluginsengine.h"
+@@ -896,6 +897,11 @@ void MainWindow::cleanup()
+     if (m_programUpdateTimer)
+         m_programUpdateTimer->stop();
+ #endif
++#ifdef Q_OS_WIN
++    // OTA: let the update task install a staged update once qBittorrent has exited.
++    // The task itself honours the "automatically install updates" setting.
++    ProgramUpdater::triggerOtaTask();
++#endif
+ 
+     // remove all child widgets
+     while (auto *w = findChild<QWidget *>())
+@@ -1715,6 +1721,45 @@ void MainWindow::handleUpdateCheckFinished(ProgramUpdater *updater, const bool i
+         updater->deleteLater();
+     };
+ 
++#ifdef Q_OS_WIN
++    // OTA builds never prompt or open the website: updates are installed silently.
++    {
++        const ProgramUpdater::OtaStatus ota = updater->otaStatus();
++        QString text;
++        Log::MsgType msgType = Log::INFO;
++        if (ota.state == u"staged")
++        {
++            text = tr("qBittorrent %1 has been downloaded and verified. It will be installed automatically after qBittorrent exits.").arg(ota.availableVersion);
++            m_ui->actionCheckForUpdates->setText(tr("Update %1 Ready (Installs on Exit)").arg(ota.availableVersion));
++        }
++        else if (ota.state == u"uptodate")
++        {
++            text = tr("qBittorrent is up to date (%1).").arg(ota.installedVersion.isEmpty() ? QStringLiteral(QBT_VERSION) : ota.installedVersion);
++        }
++        else if (ota.state == u"disabled")
++        {
++            text = tr("Automatic updates are disabled.");
++        }
++        else
++        {
++            text = tr("Automatic update check failed: %1").arg(ota.message.isEmpty() ? tr("the update service did not respond") : ota.message);
++            msgType = Log::WARNING;
++        }
++
++        LogMsg(text, msgType);
++        if (invokedByUser)
++        {
++            auto *msgBox = new QMessageBox {((msgType == Log::WARNING) ? QMessageBox::Warning : QMessageBox::Information)
++                , u"qBittorrent"_s, text, QMessageBox::Ok, this};
++            msgBox->setAttribute(Qt::WA_DeleteOnClose);
++            msgBox->setWindowModality(Qt::NonModal);
++            msgBox->show();
++        }
++        cleanup();
++        return;
++    }
++#endif
++
+     const ProgramUpdater::Version newVersion = updater->getNewVersion();
+     if (newVersion.isValid())
+     {
+diff --git a/src/gui/optionsdialog.cpp b/src/gui/optionsdialog.cpp
+index ba5911f..3d4e03b 100644
+--- a/src/gui/optionsdialog.cpp
++++ b/src/gui/optionsdialog.cpp
+@@ -363,6 +363,9 @@ void OptionsDialog::loadBehaviorTabOptions()
+ 
+ #if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+     m_ui->checkProgramUpdates->setChecked(pref->isUpdateCheckEnabled());
++#ifdef Q_OS_WIN
++    m_ui->checkProgramUpdates->setText(tr("Automatically download and install updates in the background"));
++#endif
+ #else
+     m_ui->checkProgramUpdates->setVisible(false);
+ #endif
+diff --git a/src/gui/programupdater.h b/src/gui/programupdater.h
+index 8811ee5..6af75ee 100644
+--- a/src/gui/programupdater.h
++++ b/src/gui/programupdater.h
+@@ -53,6 +53,22 @@ public:
+     Version getNewVersion() const;
+     bool updateProgram() const;
+ 
++#ifdef Q_OS_WIN
++    // OTA (over-the-air) updates: a privileged scheduled task installed by the
++    // qBittorrent installer checks, downloads, verifies and silently installs
++    // stable releases. The app only triggers it and reports its status.
++    struct OtaStatus
++    {
++        QString state;            // checking, downloading, staged, installing, uptodate, disabled, error, timeout
++        QString installedVersion;
++        QString availableVersion;
++        QString message;
++    };
++
++    OtaStatus otaStatus() const;
++    static bool triggerOtaTask();
++#endif
++
+ signals:
+     void updateCheckFinished();
+ 
+@@ -69,6 +85,9 @@ private:
+     void handleFinishedRequest();
+     RemoteSource getLatestRemoteSource() const;
+ 
++#ifdef Q_OS_WIN
++    OtaStatus m_otaStatus;
++#endif
+     int m_pendingRequestCount = 0;
+     Version m_qbtMainVersion;
+     Version m_qbtBackupVersion;
+diff --git a/src/gui/programupdater_win.cpp b/src/gui/programupdater_win.cpp
+new file mode 100644
+index 0000000..12e1e60
+--- /dev/null
++++ b/src/gui/programupdater_win.cpp
+@@ -0,0 +1,151 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ * Copyright (C) 2026  qBittorrent OTA contributors
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ * In addition, as a special exception, the copyright holders give permission to
++ * link this program with the OpenSSL project's "OpenSSL" library (or with
++ * modified versions of it that use the same license as the "OpenSSL" library),
++ * and distribute the linked executables. You must obey the GNU General Public
++ * License in all respects for all of the code used other than "OpenSSL".  If you
++ * modify file(s), you may extend this exception to your version of the file(s),
++ * but you are not obligated to do so. If you do not wish to do so, delete this
++ * exception statement from your version.
++ */
++
++// Windows implementation of ProgramUpdater for OTA builds.
++//
++// qBittorrent is installed per-machine (Program Files), so installing an update
++// needs admin rights. Instead of prompting, the installer registers a SYSTEM
++// scheduled task ("qBittorrent OTA Update", see base/ota_win.cpp)
++// that ordinary users may trigger but not modify. The task:
++//   - checks this fork's latest *stable* GitHub release,
++//   - downloads and SHA-256 verifies the installer into an admin-only folder,
++//   - installs it silently (/S) once qBittorrent is not running.
++// The app triggers the task on startup, periodically, on demand and on exit,
++// and reads the task's status from %ProgramData%\qBittorrentOTA\status.json.
++
++#include "programupdater.h"
++
++#include <QDateTime>
++#include <QFile>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QTimer>
++
++#include "base/global.h"
++#include "base/ota_win.h"
++#include "base/net/downloadmanager.h"
++
++namespace
++{
++    const int POLL_INTERVAL_MS = 1000;
++    const int POLL_TIMEOUT_SECS = 300;
++
++    struct StatusFile
++    {
++        ProgramUpdater::OtaStatus status;
++        QDateTime updatedAt;
++        bool isValid = false;
++    };
++
++    StatusFile readStatusFile()
++    {
++        StatusFile result;
++        QFile file {Ota::statusFilePath()};
++        if (!file.open(QIODevice::ReadOnly))
++            return result;
++
++        const QJsonObject obj = QJsonDocument::fromJson(file.readAll()).object();
++        if (obj.isEmpty())
++            return result;
++
++        result.status.state = obj[u"state"_s].toString();
++        result.status.installedVersion = obj[u"installed"_s].toString();
++        result.status.availableVersion = obj[u"available"_s].toString();
++        result.status.message = obj[u"message"_s].toString();
++        result.updatedAt = QDateTime::fromString(obj[u"updatedAt"_s].toString(), Qt::ISODate);
++        result.isValid = true;
++        return result;
++    }
++
++    bool isBusyState(const QString &state)
++    {
++        return (state == u"checking") || (state == u"downloading") || (state == u"installing");
++    }
++}
++
++bool ProgramUpdater::triggerOtaTask()
++{
++    return Ota::triggerTask();
++}
++
++void ProgramUpdater::checkForUpdates()
++{
++    m_otaStatus = {};
++    const QDateTime triggeredAt = QDateTime::currentDateTimeUtc().addSecs(-2);
++
++    if (!triggerOtaTask())
++    {
++        m_otaStatus.state = u"error"_s;
++        m_otaStatus.message = tr("The OTA update task is not installed. Reinstall qBittorrent to enable automatic updates.");
++        QTimer::singleShot(0, this, &ProgramUpdater::updateCheckFinished);
++        return;
++    }
++
++    auto *timer = new QTimer(this);
++    timer->setInterval(POLL_INTERVAL_MS);
++    connect(timer, &QTimer::timeout, this, [this, timer, triggeredAt]()
++    {
++        const StatusFile file = readStatusFile();
++        const bool isFresh = file.isValid && file.updatedAt.isValid() && (file.updatedAt >= triggeredAt);
++        const bool isTimedOut = (triggeredAt.secsTo(QDateTime::currentDateTimeUtc()) > POLL_TIMEOUT_SECS);
++
++        if ((isFresh && !isBusyState(file.status.state)) || isTimedOut)
++        {
++            timer->stop();
++            timer->deleteLater();
++            m_otaStatus = file.status;
++            if (!isFresh || isBusyState(m_otaStatus.state))
++                m_otaStatus.state = u"timeout"_s;
++            emit updateCheckFinished();
++        }
++    });
++    timer->start();
++}
++
++ProgramUpdater::OtaStatus ProgramUpdater::otaStatus() const
++{
++    return m_otaStatus;
++}
++
++ProgramUpdater::Version ProgramUpdater::getNewVersion() const
++{
++    if (m_otaStatus.state == u"staged")
++        return Version::fromString(m_otaStatus.availableVersion);
++    return {};
++}
++
++bool ProgramUpdater::updateProgram() const
++{
++    // A staged update is installed by the OTA task as soon as qBittorrent exits.
++    return triggerOtaTask();
++}
++
++void ProgramUpdater::fallbackDownloadFinished([[maybe_unused]] const Net::DownloadResult &result, [[maybe_unused]] Version &version)
++{
++    // Not used by OTA builds (declared as a slot in the shared header).
++}
