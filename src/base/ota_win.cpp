@@ -81,6 +81,8 @@ namespace
     const int WAIT_FOR_EXIT_SECS = 90;
     const int MAX_INSTALL_ATTEMPTS = 3;
 
+    bool ensureDataDir();
+
     struct Release
     {
         QVersionNumber version;
